@@ -1,0 +1,805 @@
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import {
+  BarChart, Bar, XAxis, YAxis, Cell, ReferenceLine, ResponsiveContainer, Tooltip, LabelList,
+} from "recharts";
+import Papa from "papaparse";
+import * as XLSX from "xlsx";
+
+/* ============================================================================
+   MIC / ECOFF Analysis Platform
+   - Upload MIC distribution data (CSV / Excel)
+   - Compute ECOFF (ECOFFinder-style log-normal fit, Turnidge et al. 2006)
+   - Interpret wild-type (WT) vs non-wild-type (NWT)
+   - Live editing, QC flagging, raw data access, export
+   ============================================================================ */
+
+/* ---------- color tokens (clinical instrument palette) ---------- */
+const C = {
+  ink: "#0F172A", sub: "#475569", line: "#E2E8F0", line2: "#CBD5E1",
+  bg: "#F6F8FA", surface: "#FFFFFF",
+  teal: "#0E7C7B", tealDark: "#0B5E5D", tealSoft: "#D7ECEB",
+  amber: "#D97706", amberSoft: "#FDE9CE",
+  rose: "#E11D48", roseSoft: "#FCE2E8",
+  emerald: "#059669",
+  wt: "#0E7C7B", nwt: "#D97706",
+};
+
+/* ---------- doubling-dilution helpers ---------- */
+const LOW_LABELS = {
+  "-1": "0.5", "-2": "0.25", "-3": "0.125", "-4": "0.06", "-5": "0.03",
+  "-6": "0.016", "-7": "0.008", "-8": "0.004", "-9": "0.002", "-10": "0.001",
+};
+function log2Label(k) {
+  if (k >= 0) return String(Math.pow(2, k));
+  return LOW_LABELS[String(k)] || Number(Math.pow(2, k)).toPrecision(2);
+}
+
+/* parse a MIC string like "<=0.25", ">32", "0.5", "≥64" -> {value, censor, log2} */
+function parseMic(raw) {
+  if (raw === null || raw === undefined) return null;
+  let s = String(raw).trim().replace(/≤/g, "<=").replace(/≥/g, ">=").replace(/,/g, ".").replace(/\s+/g, "");
+  if (!s) return null;
+  let censor = "";
+  const m = s.match(/^(<=|>=|<|>|=)?(.+)$/);
+  if (!m) return null;
+  censor = m[1] || "";
+  const num = parseFloat(m[2]);
+  if (!isFinite(num) || num <= 0) return null;
+  let log2 = Math.round(Math.log2(num));
+  // off-scale conventions: ">x" sits one dilution above x; "<=x" at x (or below)
+  if (censor === ">" || censor === ">=") log2 = censor === ">" ? log2 + 1 : log2;
+  return { value: num, censor, log2 };
+}
+
+/* ---------- statistics: normal CDF ---------- */
+function erf(x) {
+  const t = 1 / (1 + 0.3275911 * Math.abs(x));
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return x >= 0 ? y : -y;
+}
+const normCdf = (x, mean, sd) => 0.5 * (1 + erf((x - mean) / (sd * Math.SQRT2)));
+
+/* ---------- ECOFFinder-style fit ---------- */
+function ecoffFinder(distMap) {
+  // distMap: Map<log2:number, count:number>
+  const dist = [...distMap.entries()].map(([log2, count]) => ({ log2: Number(log2), count })).sort((a, b) => a.log2 - b.log2);
+  if (!dist.length) return null;
+  const N = dist.reduce((s, d) => s + d.count, 0);
+  if (N < 1) return null;
+  let modeI = 0;
+  for (let i = 1; i < dist.length; i++) if (dist[i].count > dist[modeI].count) modeI = i;
+
+  let best = null;
+  for (let end = modeI; end < dist.length; end++) {
+    const obs = []; let c = 0;
+    for (let i = 0; i <= end; i++) { c += dist[i].count; obs.push({ x: dist[i].log2, cum: c }); }
+    const wtN = c;
+    if (wtN < 8 || obs.length < 3) continue;
+    let local = null;
+    for (let mean = dist[0].log2 - 1; mean <= dist[end].log2 + 1; mean += 0.1) {
+      for (let sd = 0.3; sd <= 2.5; sd += 0.05) {
+        const cdfs = obs.map((p) => normCdf(p.x + 0.5, mean, sd));
+        let sCC = 0, sCC2 = 0;
+        for (let i = 0; i < obs.length; i++) { sCC += cdfs[i] * obs[i].cum; sCC2 += cdfs[i] * cdfs[i]; }
+        if (sCC2 === 0) continue;
+        const scale = sCC / sCC2;
+        if (scale < wtN * 0.9 || scale > N * 1.6) continue;
+        let sse = 0; for (let i = 0; i < obs.length; i++) { const e = scale * cdfs[i] - obs[i].cum; sse += e * e; }
+        if (!local || sse < local.sse) local = { mean, sd, scale, sse };
+      }
+    }
+    if (!local) continue;
+    const meanCum = obs.reduce((s, p) => s + p.cum, 0) / obs.length;
+    let sstot = 0; obs.forEach((p) => (sstot += (p.cum - meanCum) ** 2));
+    const r2 = sstot > 0 ? 1 - local.sse / sstot : 1;
+    const cand = { end, ...local, r2, wtN, fittedWT: local.scale };
+    // prefer higher R2; on near-tie prefer fewer included bins (avoid swallowing resistant tail)
+    if (!best || cand.r2 > best.r2 + 0.0015 || (Math.abs(cand.r2 - best.r2) <= 0.0015 && cand.wtN < best.wtN)) best = cand;
+  }
+  if (!best) return null;
+  const Z = { 0.95: 1.6449, 0.975: 1.96, 0.99: 2.3263, 0.995: 2.5758 };
+  const dilFor = (p) => Math.ceil(best.mean + Z[p] * best.sd - 0.5);
+  return {
+    mean: best.mean, sd: best.sd, r2: best.r2, fittedWT: best.fittedWT, N,
+    e95: dilFor(0.95), e975: dilFor(0.975), e99: dilFor(0.99), e995: dilFor(0.995),
+  };
+}
+
+/* ---------- MIC50 / MIC90 / range ---------- */
+function micPercentiles(dist) {
+  const sorted = [...dist.entries()].map(([l, c]) => ({ l: Number(l), c })).sort((a, b) => a.l - b.l);
+  const N = sorted.reduce((s, d) => s + d.c, 0);
+  if (!N) return null;
+  const at = (p) => {
+    const target = N * p; let cum = 0;
+    for (const d of sorted) { cum += d.c; if (cum >= target) return d.l; }
+    return sorted[sorted.length - 1].l;
+  };
+  return { mic50: at(0.5), mic90: at(0.9), min: sorted[0].l, max: sorted[sorted.length - 1].l, N };
+}
+
+/* ---------- QC checks ---------- */
+function qcChecks(dist, ecoff, parseStats) {
+  const flags = [];
+  const sorted = [...dist.entries()].map(([l, c]) => ({ l: Number(l), c })).sort((a, b) => a.l - b.l);
+  const N = sorted.reduce((s, d) => s + d.c, 0);
+  if (N < 100) flags.push({ level: N < 30 ? "error" : "warn", code: "low_n", msg: `จำนวนเชื้อ n=${N} ต่ำ — EUCAST แนะนำรวมข้อมูล ≥100 (และจากหลายแหล่ง) เพื่อกำหนด ECOFF ที่เชื่อถือได้` });
+  // modal at lowest tested -> truncated distribution
+  let modeI = 0; for (let i = 1; i < sorted.length; i++) if (sorted[i].c > sorted[modeI].c) modeI = i;
+  if (modeI === 0 && sorted.length > 1) flags.push({ level: "warn", code: "truncated_low", msg: "พีคของการกระจายอยู่ที่ความเข้มข้นต่ำสุดที่ทดสอบ — distribution อาจถูกตัด (truncated) ทำให้ประเมิน wild-type ไม่ครบ ควรทดสอบเจือจางต่ำลงอีก" });
+  // gaps (missing intermediate dilutions)
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].l - sorted[i - 1].l > 1) { flags.push({ level: "warn", code: "gap", msg: `มีช่องเจือจางที่หายไประหว่าง ${log2Label(sorted[i - 1].l)} และ ${log2Label(sorted[i].l)} — ตรวจสอบความครบถ้วนของข้อมูล` }); break; }
+  }
+  // off-scale proportions
+  if (parseStats) {
+    if (parseStats.lowOff / N > 0.1) flags.push({ level: "warn", code: "off_low", msg: `ค่า "≤" (off-scale ต่ำ) คิดเป็น ${(parseStats.lowOff / N * 100).toFixed(0)}% — distribution อาจถูกตัดด้านล่าง` });
+    if (parseStats.highOff / N > 0.2) flags.push({ level: "info", code: "off_high", msg: `ค่า ">" (off-scale สูง) คิดเป็น ${(parseStats.highOff / N * 100).toFixed(0)}% — เชื้อกลุ่มดื้อจำนวนมาก เป็นเรื่องปกติได้แต่ควรตรวจสอบ` });
+  }
+  // fit quality
+  if (ecoff && ecoff.r2 < 0.97) flags.push({ level: "warn", code: "poor_fit", msg: `การ fit log-normal มี R²=${ecoff.r2.toFixed(3)} (ต่ำ) — distribution อาจ multimodal หรือไม่ใช่ log-normal ควรตรวจสอบ ECOFF ด้วยตา` });
+  if (ecoff && ecoff.sd > 1.6) flags.push({ level: "info", code: "wide_sd", msg: `ส่วนเบี่ยงเบนของ wild-type กว้างผิดปกติ (SD=${ecoff.sd.toFixed(2)} log2) — อาจมีการปนของหลายประชากร` });
+  if (!flags.length) flags.push({ level: "ok", code: "ok", msg: "ผ่านการตรวจสอบเบื้องต้น — ไม่พบสัญญาณผิดปกติชัดเจน" });
+  return flags;
+}
+
+/* ---------- build per-combo analysis from normalized records ---------- */
+/* record: {organism, antibiotic, log2, count, censorLow, censorHigh} */
+function buildAnalyses(records) {
+  const groups = new Map();
+  for (const r of records) {
+    const key = `${r.organism}||${r.antibiotic}`;
+    if (!groups.has(key)) groups.set(key, { organism: r.organism, antibiotic: r.antibiotic, dist: new Map(), lowOff: 0, highOff: 0 });
+    const g = groups.get(key);
+    g.dist.set(r.log2, (g.dist.get(r.log2) || 0) + r.count);
+    if (r.censorLow) g.lowOff += r.count;
+    if (r.censorHigh) g.highOff += r.count;
+  }
+  const out = [];
+  for (const g of groups.values()) {
+    const ecoff = ecoffFinder(g.dist);
+    const pct = micPercentiles(g.dist);
+    const flags = qcChecks(g.dist, ecoff, { lowOff: g.lowOff, highOff: g.highOff });
+    out.push({ ...g, ecoff, pct, flags });
+  }
+  out.sort((a, b) => (a.organism + a.antibiotic).localeCompare(b.organism + b.antibiotic));
+  return out;
+}
+
+/* ============================================================================
+   File parsing & format detection
+   ============================================================================ */
+const ORG_HINTS = ["organism", "species", "bug", "เชื้อ", "bacteria", "strain"];
+const AB_HINTS = ["antibiotic", "antimicrobial", "drug", "agent", "ยา", "atb"];
+const MIC_HINTS = ["mic", "value", "result", "ค่า"];
+const COUNT_HINTS = ["count", "n", "number", "freq", "จำนวน", "isolates"];
+
+function looksLikeDilution(h) {
+  const s = String(h).trim().replace(/≤|≥|<=|>=|<|>/g, "");
+  const n = parseFloat(s);
+  if (!isFinite(n) || n <= 0) return false;
+  return Math.abs(Math.log2(n) - Math.round(Math.log2(n))) < 0.06;
+}
+function findCol(headers, hints) {
+  const lower = headers.map((h) => String(h).toLowerCase());
+  for (const hint of hints) { const i = lower.findIndex((h) => h.includes(hint)); if (i >= 0) return headers[i]; }
+  return null;
+}
+function detectFormat(headers) {
+  const dilCols = headers.filter(looksLikeDilution);
+  const org = findCol(headers, ORG_HINTS);
+  const ab = findCol(headers, AB_HINTS);
+  const mic = findCol(headers, MIC_HINTS);
+  const count = findCol(headers, COUNT_HINTS);
+  if (dilCols.length >= 3) return { format: "wide", org, ab, dilCols };
+  if (mic && count) return { format: "aggregated", org, ab, mic, count };
+  return { format: "isolate", org, ab, mic: mic || headers.find((h) => !ORG_HINTS.concat(AB_HINTS).some((x) => String(h).toLowerCase().includes(x))) };
+}
+
+function normalizeRows(rows, mapping) {
+  const recs = [];
+  const { format, org, ab, mic, count, dilCols } = mapping;
+  for (const row of rows) {
+    const organism = (org ? row[org] : "ไม่ระบุเชื้อ") ?? "ไม่ระบุเชื้อ";
+    const antibiotic = (ab ? row[ab] : "ไม่ระบุยา") ?? "ไม่ระบุยา";
+    if (format === "wide") {
+      for (const dc of dilCols) {
+        const cnt = parseFloat(row[dc]); if (!isFinite(cnt) || cnt <= 0) continue;
+        const p = parseMic(dc); if (!p) continue;
+        recs.push({ organism, antibiotic, log2: p.log2, count: cnt, censorLow: false, censorHigh: false });
+      }
+    } else if (format === "aggregated") {
+      const p = parseMic(row[mic]); const cnt = parseFloat(row[count]);
+      if (!p || !isFinite(cnt) || cnt <= 0) continue;
+      recs.push({ organism, antibiotic, log2: p.log2, count: cnt, censorLow: p.censor.startsWith("<"), censorHigh: p.censor.startsWith(">") });
+    } else {
+      const p = parseMic(row[mic]); if (!p) continue;
+      recs.push({ organism, antibiotic, log2: p.log2, count: 1, censorLow: p.censor.startsWith("<"), censorHigh: p.censor.startsWith(">") });
+    }
+  }
+  return recs;
+}
+
+/* ============================================================================
+   Persistent storage helpers (artifact window.storage)
+   ============================================================================ */
+const hasStore = typeof window !== "undefined" && window.storage;
+async function saveDataset(ds) {
+  if (!hasStore) return;
+  try {
+    await window.storage.set(`mic:ds:${ds.id}`, JSON.stringify(ds), false);
+    const idx = await listIndex();
+    const meta = { id: ds.id, name: ds.name, at: ds.at, n: ds.records.length };
+    const next = [meta, ...idx.filter((m) => m.id !== ds.id)];
+    await window.storage.set("mic:index", JSON.stringify(next), false);
+  } catch (e) { console.error("save failed", e); }
+}
+async function listIndex() {
+  if (!hasStore) return [];
+  try { const r = await window.storage.get("mic:index", false); return r ? JSON.parse(r.value) : []; }
+  catch { return []; }
+}
+async function loadDataset(id) {
+  if (!hasStore) return null;
+  try { const r = await window.storage.get(`mic:ds:${id}`, false); return r ? JSON.parse(r.value) : null; }
+  catch { return null; }
+}
+async function deleteDataset(id) {
+  if (!hasStore) return;
+  try {
+    await window.storage.delete(`mic:ds:${id}`, false);
+    const idx = await listIndex();
+    await window.storage.set("mic:index", JSON.stringify(idx.filter((m) => m.id !== id)), false);
+  } catch (e) { console.error(e); }
+}
+
+/* ============================================================================
+   Small UI atoms
+   ============================================================================ */
+const mono = { fontFamily: "'IBM Plex Mono', ui-monospace, monospace", fontVariantNumeric: "tabular-nums" };
+const display = { fontFamily: "'Space Grotesk', system-ui, sans-serif" };
+
+function Chip({ children, tone = "teal" }) {
+  const m = {
+    teal: { bg: C.tealSoft, fg: C.tealDark }, amber: { bg: C.amberSoft, fg: "#92400E" },
+    rose: { bg: C.roseSoft, fg: "#9F1239" }, slate: { bg: "#EEF2F6", fg: C.sub },
+  }[tone];
+  return <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" style={{ background: m.bg, color: m.fg }}>{children}</span>;
+}
+function Stat({ label, value, sub }) {
+  return (
+    <div className="flex flex-col">
+      <span className="text-xs uppercase tracking-wide" style={{ color: C.sub, letterSpacing: "0.06em" }}>{label}</span>
+      <span className="text-lg font-semibold" style={{ ...mono, color: C.ink }}>{value}</span>
+      {sub && <span className="text-xs" style={{ color: C.sub }}>{sub}</span>}
+    </div>
+  );
+}
+
+/* ============================================================================
+   Main component
+   ============================================================================ */
+export default function App() {
+  const [datasets, setDatasets] = useState([]); // index metas
+  const [active, setActive] = useState(null);    // full dataset {id,name,at,records,overrides}
+  const [analyses, setAnalyses] = useState([]);
+  const [selected, setSelected] = useState(0);
+  const [pendingFile, setPendingFile] = useState(null); // {rows, headers, mapping, name}
+  const [view, setView] = useState("dashboard"); // dashboard | raw
+  const [toast, setToast] = useState(null);
+  const fileRef = useRef();
+
+  const notify = (msg, tone = "teal") => { setToast({ msg, tone }); setTimeout(() => setToast(null), 2600); };
+
+  /* load index on mount */
+  useEffect(() => { listIndex().then(setDatasets); }, []);
+
+  /* recompute analyses whenever active dataset changes */
+  useEffect(() => {
+    if (!active) { setAnalyses([]); return; }
+    const a = buildAnalyses(active.records);
+    // apply manual overrides
+    const ov = active.overrides || {};
+    a.forEach((x) => { const k = `${x.organism}||${x.antibiotic}`; if (ov[k] != null) x.manualEcoff = ov[k]; });
+    setAnalyses(a);
+    setSelected((s) => Math.min(s, Math.max(0, a.length - 1)));
+  }, [active]);
+
+  /* ---- file handling ---- */
+  function onFile(e) {
+    const file = e.target.files?.[0]; if (!file) return;
+    const ext = file.name.split(".").pop().toLowerCase();
+    if (ext === "csv" || ext === "tsv" || ext === "txt") {
+      Papa.parse(file, {
+        header: true, skipEmptyLines: true,
+        complete: (res) => ingest(res.data, res.meta.fields || Object.keys(res.data[0] || {}), file.name),
+        error: () => notify("อ่านไฟล์ CSV ไม่สำเร็จ ตรวจสอบรูปแบบไฟล์", "rose"),
+      });
+    } else if (ext === "xlsx" || ext === "xls") {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          const wb = XLSX.read(ev.target.result, { type: "array" });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const json = XLSX.utils.sheet_to_json(ws, { defval: "" });
+          ingest(json, Object.keys(json[0] || {}), file.name);
+        } catch { notify("อ่านไฟล์ Excel ไม่สำเร็จ", "rose"); }
+      };
+      reader.readAsArrayBuffer(file);
+    } else notify("รองรับเฉพาะไฟล์ .csv และ .xlsx", "rose");
+    e.target.value = "";
+  }
+  function ingest(rows, headers, name) {
+    rows = rows.filter((r) => Object.values(r).some((v) => v !== "" && v != null));
+    if (!rows.length) { notify("ไม่พบข้อมูลในไฟล์", "rose"); return; }
+    const mapping = detectFormat(headers);
+    setPendingFile({ rows, headers, mapping, name });
+  }
+  async function confirmImport() {
+    const { rows, mapping, name } = pendingFile;
+    const records = normalizeRows(rows, mapping);
+    if (!records.length) { notify("แปลงข้อมูลไม่ได้ — ตรวจสอบการจับคู่คอลัมน์", "rose"); return; }
+    const ds = { id: "ds_" + Date.now(), name, at: new Date().toISOString(), records, overrides: {} };
+    setActive(ds); setPendingFile(null); setSelected(0); setView("dashboard");
+    await saveDataset(ds);
+    setDatasets(await listIndex());
+    notify(`นำเข้า ${records.reduce((s, r) => s + r.count, 0)} เชื้อ สำเร็จ`);
+  }
+  async function openDataset(id) {
+    const ds = await loadDataset(id);
+    if (ds) { setActive(ds); setSelected(0); setView("dashboard"); }
+    else notify("เปิดชุดข้อมูลไม่สำเร็จ", "rose");
+  }
+  async function removeDataset(id) {
+    await deleteDataset(id); setDatasets(await listIndex());
+    if (active?.id === id) { setActive(null); setAnalyses([]); }
+    notify("ลบชุดข้อมูลแล้ว", "slate");
+  }
+
+  /* ---- live edit of raw distribution ---- */
+  const updateCount = useCallback((organism, antibiotic, log2, newCount) => {
+    setActive((prev) => {
+      if (!prev) return prev;
+      const records = prev.records.map((r) => ({ ...r }));
+      // collapse to per-(combo,log2) by adjusting/inserting an aggregated record
+      const idx = records.findIndex((r) => r.organism === organism && r.antibiotic === antibiotic && r.log2 === log2);
+      const val = Math.max(0, parseFloat(newCount) || 0);
+      if (idx >= 0) {
+        // remove all matching then re-add single aggregated row
+        const others = records.filter((r) => !(r.organism === organism && r.antibiotic === antibiotic && r.log2 === log2));
+        if (val > 0) others.push({ organism, antibiotic, log2, count: val, censorLow: false, censorHigh: false });
+        const next = { ...prev, records: others };
+        saveDataset(next); return next;
+      } else if (val > 0) {
+        records.push({ organism, antibiotic, log2, count: val, censorLow: false, censorHigh: false });
+        const next = { ...prev, records }; saveDataset(next); return next;
+      }
+      return prev;
+    });
+  }, []);
+
+  const setOverride = useCallback((organism, antibiotic, ecoffLog2) => {
+    setActive((prev) => {
+      if (!prev) return prev;
+      const overrides = { ...(prev.overrides || {}) };
+      const k = `${organism}||${antibiotic}`;
+      if (ecoffLog2 === null) delete overrides[k]; else overrides[k] = ecoffLog2;
+      const next = { ...prev, overrides }; saveDataset(next); return next;
+    });
+  }, []);
+
+  /* ---- export ---- */
+  function exportAll() {
+    if (!analyses.length) return;
+    const wb = XLSX.utils.book_new();
+    // Summary sheet
+    const summary = analyses.map((a) => {
+      const eff = a.manualEcoff ?? a.ecoff?.e99;
+      const nwt = a.pct ? [...a.dist.entries()].filter(([l]) => Number(l) > eff).reduce((s, [, c]) => s + c, 0) : 0;
+      return {
+        Organism: a.organism, Antibiotic: a.antibiotic, N: a.pct?.N ?? 0,
+        "MIC50": a.pct ? log2Label(a.pct.mic50) : "", "MIC90": a.pct ? log2Label(a.pct.mic90) : "",
+        "Range": a.pct ? `${log2Label(a.pct.min)}-${log2Label(a.pct.max)}` : "",
+        "ECOFF_computed_99%": a.ecoff ? log2Label(a.ecoff.e99) : "",
+        "ECOFF_used": eff != null ? log2Label(eff) : "",
+        "ECOFF_source": a.manualEcoff != null ? "manual" : "computed",
+        "Fit_R2": a.ecoff ? a.ecoff.r2.toFixed(3) : "",
+        "WT_%": a.pct ? (((a.pct.N - nwt) / a.pct.N) * 100).toFixed(1) : "",
+        "NWT_%": a.pct ? ((nwt / a.pct.N) * 100).toFixed(1) : "",
+        "QC": a.flags.map((f) => f.code).join("; "),
+      };
+    });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summary), "Summary");
+    // Raw distribution sheet
+    const raw = [];
+    analyses.forEach((a) => [...a.dist.entries()].sort((x, y) => x[0] - y[0]).forEach(([l, c]) =>
+      raw.push({ Organism: a.organism, Antibiotic: a.antibiotic, MIC: log2Label(Number(l)), Count: c })));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(raw), "Distributions");
+    XLSX.writeFile(wb, `MIC_ECOFF_${active?.name?.replace(/\.[^.]+$/, "") || "export"}.xlsx`);
+    notify("ส่งออกไฟล์ Excel แล้ว", "emerald");
+  }
+
+  function downloadTemplate() {
+    const rows = [
+      { Organism: "Escherichia coli", Antibiotic: "Ciprofloxacin", MIC: "0.008", Count: 5 },
+      { Organism: "Escherichia coli", Antibiotic: "Ciprofloxacin", MIC: "0.016", Count: 60 },
+      { Organism: "Escherichia coli", Antibiotic: "Ciprofloxacin", MIC: "0.03", Count: 180 },
+      { Organism: "Escherichia coli", Antibiotic: "Ciprofloxacin", MIC: "0.06", Count: 90 },
+      { Organism: "Escherichia coli", Antibiotic: "Ciprofloxacin", MIC: "0.125", Count: 25 },
+      { Organism: "Escherichia coli", Antibiotic: "Ciprofloxacin", MIC: ">2", Count: 47 },
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), "Template");
+    XLSX.writeFile(wb, "MIC_template.xlsx");
+  }
+
+  const current = analyses[selected];
+
+  return (
+    <div style={{ background: C.bg, color: C.ink, minHeight: "100%", fontFamily: "Inter, system-ui, sans-serif" }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+        input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+        .mic-scroll::-webkit-scrollbar{height:8px;width:8px}.mic-scroll::-webkit-scrollbar-thumb{background:#CBD5E1;border-radius:8px}`}</style>
+
+      {/* Header */}
+      <header className="border-b" style={{ borderColor: C.line, background: C.surface }}>
+        <div className="mx-auto max-w-7xl px-5 py-3 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-md" style={{ background: C.teal }}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2"><path d="M3 3v18h18" /><path d="M7 14l3-5 3 4 4-7" /></svg>
+            </div>
+            <div>
+              <div className="text-base font-bold leading-tight" style={display}>MIC · ECOFF Analyzer</div>
+              <div className="text-xs" style={{ color: C.sub }}>วิเคราะห์การกระจาย MIC และกำหนดค่า ECOFF</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={() => fileRef.current?.click()} className="rounded-md px-3 py-2 text-sm font-medium text-white" style={{ background: C.teal }}>อัปโหลดไฟล์</button>
+            <input ref={fileRef} type="file" accept=".csv,.tsv,.txt,.xlsx,.xls" onChange={onFile} className="hidden" />
+            <button onClick={downloadTemplate} className="rounded-md border px-3 py-2 text-sm font-medium" style={{ borderColor: C.line2, color: C.sub }}>เทมเพลต</button>
+          </div>
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-7xl px-5 py-5 grid grid-cols-12 gap-5">
+        {/* Sidebar: datasets + combos */}
+        <aside className="col-span-12 lg:col-span-3 space-y-4">
+          <Section title="ชุดข้อมูล">
+            {!hasStore && <p className="text-xs mb-2" style={{ color: C.amber }}>โหมดชั่วคราว: เบราว์เซอร์นี้ไม่บันทึกข้อมูลถาวร</p>}
+            {datasets.length === 0 && <p className="text-sm" style={{ color: C.sub }}>ยังไม่มีข้อมูล — อัปโหลดไฟล์เพื่อเริ่ม</p>}
+            <ul className="space-y-1">
+              {datasets.map((d) => (
+                <li key={d.id} className="flex items-center justify-between rounded-md px-2 py-1.5 text-sm cursor-pointer"
+                  style={{ background: active?.id === d.id ? C.tealSoft : "transparent" }}
+                  onClick={() => openDataset(d.id)}>
+                  <span className="truncate">{d.name}</span>
+                  <button onClick={(e) => { e.stopPropagation(); removeDataset(d.id); }} className="text-xs ml-2 shrink-0" style={{ color: C.sub }}>ลบ</button>
+                </li>
+              ))}
+            </ul>
+          </Section>
+
+          {analyses.length > 0 && (
+            <Section title={`คู่เชื้อ–ยา (${analyses.length})`}>
+              <ul className="space-y-1 max-h-96 overflow-auto mic-scroll">
+                {analyses.map((a, i) => {
+                  const worst = a.flags.some((f) => f.level === "error") ? "rose" : a.flags.some((f) => f.level === "warn") ? "amber" : "emerald";
+                  return (
+                    <li key={i} onClick={() => { setSelected(i); setView("dashboard"); }}
+                      className="rounded-md px-2 py-1.5 cursor-pointer"
+                      style={{ background: selected === i ? C.tealSoft : "transparent" }}>
+                      <div className="flex items-center gap-2">
+                        <span className="h-2 w-2 rounded-full shrink-0" style={{ background: worst === "rose" ? C.rose : worst === "amber" ? C.amber : C.emerald }} />
+                        <span className="text-sm italic truncate" style={display}>{a.organism}</span>
+                      </div>
+                      <span className="text-xs ml-4" style={{ color: C.sub }}>{a.antibiotic} · n={a.pct?.N ?? 0}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </Section>
+          )}
+        </aside>
+
+        {/* Main panel */}
+        <main className="col-span-12 lg:col-span-9 space-y-4">
+          {!active && <EmptyState onUpload={() => fileRef.current?.click()} onTemplate={downloadTemplate} />}
+
+          {active && (
+            <>
+              <div className="flex items-center justify-between gap-3">
+                <div className="inline-flex rounded-md border" style={{ borderColor: C.line2 }}>
+                  {[["dashboard", "วิเคราะห์ & แสดงผล"], ["raw", "ข้อมูลดิบ"]].map(([k, t]) => (
+                    <button key={k} onClick={() => setView(k)} className="px-3 py-1.5 text-sm font-medium"
+                      style={{ background: view === k ? C.teal : C.surface, color: view === k ? "#fff" : C.sub }}>{t}</button>
+                  ))}
+                </div>
+                <button onClick={exportAll} className="rounded-md border px-3 py-2 text-sm font-medium" style={{ borderColor: C.teal, color: C.teal }}>ส่งออก Excel</button>
+              </div>
+
+              {view === "dashboard" && current && (
+                <ComboDashboard a={current} onOverride={setOverride} />
+              )}
+              {view === "raw" && (
+                <RawData analyses={analyses} onEdit={updateCount} />
+              )}
+            </>
+          )}
+        </main>
+      </div>
+
+      {/* Import mapping modal */}
+      {pendingFile && (
+        <ImportModal pending={pendingFile} setPending={setPendingFile} onConfirm={confirmImport} />
+      )}
+
+      {/* toast */}
+      {toast && (
+        <div className="fixed bottom-5 left-1/2 -translate-x-1/2 rounded-md px-4 py-2 text-sm text-white shadow-lg z-50"
+          style={{ background: toast.tone === "rose" ? C.rose : toast.tone === "emerald" ? C.emerald : toast.tone === "slate" ? C.sub : C.teal }}>
+          {toast.msg}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================================
+   Sub-components
+   ============================================================================ */
+function Section({ title, children }) {
+  return (
+    <div className="rounded-lg border p-3" style={{ borderColor: C.line, background: C.surface }}>
+      <h3 className="text-xs font-semibold uppercase mb-2" style={{ color: C.sub, letterSpacing: "0.06em" }}>{title}</h3>
+      {children}
+    </div>
+  );
+}
+
+function EmptyState({ onUpload, onTemplate }) {
+  return (
+    <div className="rounded-lg border p-10 text-center" style={{ borderColor: C.line, background: C.surface }}>
+      <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-xl" style={{ background: C.tealSoft }}>
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke={C.teal} strokeWidth="2"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+      </div>
+      <h2 className="text-xl font-bold mb-1" style={display}>เริ่มต้นด้วยการอัปโหลดข้อมูล MIC</h2>
+      <p className="text-sm mb-5 mx-auto max-w-lg" style={{ color: C.sub }}>
+        รองรับไฟล์ CSV และ Excel ทั้งแบบ <b>รายเชื้อ</b> (1 แถวต่อ 1 isolate), แบบ <b>นับรวม</b> (เชื้อ–ยา–MIC–จำนวน) และแบบ <b>ตารางกว้าง</b> (คอลัมน์เป็นค่าเจือจาง) ระบบจะตรวจจับรูปแบบให้อัตโนมัติ
+      </p>
+      <div className="flex items-center justify-center gap-2">
+        <button onClick={onUpload} className="rounded-md px-4 py-2 text-sm font-medium text-white" style={{ background: C.teal }}>เลือกไฟล์</button>
+        <button onClick={onTemplate} className="rounded-md border px-4 py-2 text-sm font-medium" style={{ borderColor: C.line2, color: C.sub }}>ดาวน์โหลดเทมเพลตตัวอย่าง</button>
+      </div>
+    </div>
+  );
+}
+
+function ImportModal({ pending, setPending, onConfirm }) {
+  const { headers, mapping, rows } = pending;
+  const [m, setM] = useState(mapping);
+  const set = (k, v) => setM((p) => ({ ...p, [k]: v || null }));
+  const Sel = ({ label, value, onChange, opts }) => (
+    <label className="block text-sm">
+      <span className="text-xs" style={{ color: C.sub }}>{label}</span>
+      <select value={value || ""} onChange={(e) => onChange(e.target.value)} className="mt-1 w-full rounded-md border px-2 py-1.5 text-sm" style={{ borderColor: C.line2 }}>
+        <option value="">— ไม่ใช้ —</option>
+        {opts.map((h) => <option key={h} value={h}>{h}</option>)}
+      </select>
+    </label>
+  );
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(15,23,42,0.45)" }}>
+      <div className="w-full max-w-2xl rounded-lg p-5" style={{ background: C.surface }}>
+        <h3 className="text-lg font-bold mb-1" style={display}>ยืนยันการจับคู่คอลัมน์</h3>
+        <p className="text-sm mb-4" style={{ color: C.sub }}>
+          ตรวจพบรูปแบบ: <Chip tone="teal">{m.format === "wide" ? "ตารางกว้าง" : m.format === "aggregated" ? "นับรวม" : "รายเชื้อ"}</Chip> — ปรับการจับคู่ได้หากไม่ถูกต้อง
+        </p>
+        <div className="grid grid-cols-2 gap-3 mb-4">
+          <Sel label="คอลัมน์เชื้อ (Organism)" value={m.org} onChange={(v) => set("org", v)} opts={headers} />
+          <Sel label="คอลัมน์ยา (Antibiotic)" value={m.ab} onChange={(v) => set("ab", v)} opts={headers} />
+          {m.format !== "wide" && <Sel label="คอลัมน์ค่า MIC" value={m.mic} onChange={(v) => set("mic", v)} opts={headers} />}
+          {m.format === "aggregated" && <Sel label="คอลัมน์จำนวน (Count)" value={m.count} onChange={(v) => set("count", v)} opts={headers} />}
+        </div>
+        {m.format === "wide" && (
+          <p className="text-xs mb-4 rounded-md p-2" style={{ background: C.bg, color: C.sub }}>
+            คอลัมน์ค่าเจือจางที่ตรวจพบ: {m.dilCols.join(", ")}
+          </p>
+        )}
+        <p className="text-xs mb-4" style={{ color: C.sub }}>ตัวอย่าง {Math.min(rows.length, 3)} แถวแรกจะถูกใช้ตรวจสอบ · ทั้งหมด {rows.length} แถว</p>
+        <div className="flex justify-end gap-2">
+          <button onClick={() => setPending(null)} className="rounded-md border px-3 py-2 text-sm" style={{ borderColor: C.line2, color: C.sub }}>ยกเลิก</button>
+          <button onClick={() => { pending.mapping = m; onConfirm(); }} className="rounded-md px-3 py-2 text-sm font-medium text-white" style={{ background: C.teal }}>นำเข้าข้อมูล</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ComboDashboard({ a, onOverride }) {
+  const eff = a.manualEcoff ?? a.ecoff?.e99 ?? null;
+  const chartData = useMemo(() => {
+    const entries = [...a.dist.entries()].map(([l, c]) => ({ l: Number(l), c })).sort((x, y) => x.l - y.l);
+    // fill gaps for continuous axis
+    if (entries.length) {
+      const filled = []; const min = entries[0].l, max = entries[entries.length - 1].l;
+      for (let k = min; k <= max; k++) { const f = entries.find((e) => e.l === k); filled.push({ l: k, c: f ? f.c : 0 }); }
+      return filled.map((e) => ({ label: log2Label(e.l), log2: e.l, count: e.c, wt: eff != null && e.l <= eff ? e.c : 0, nwt: eff != null && e.l > eff ? e.c : 0 }));
+    }
+    return [];
+  }, [a, eff]);
+
+  const nwtCount = useMemo(() => eff == null ? 0 : [...a.dist.entries()].filter(([l]) => Number(l) > eff).reduce((s, [, c]) => s + c, 0), [a, eff]);
+  const N = a.pct?.N ?? 0;
+  const wtPct = N ? ((N - nwtCount) / N * 100) : 0;
+
+  const ecoffOpts = [];
+  for (let k = (a.pct?.min ?? -9); k <= (a.pct?.max ?? 8) + 1; k++) ecoffOpts.push(k);
+
+  return (
+    <div className="space-y-4">
+      {/* header card */}
+      <div className="rounded-lg border p-4" style={{ borderColor: C.line, background: C.surface }}>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-xl font-bold italic" style={display}>{a.organism}</h2>
+            <p className="text-sm" style={{ color: C.sub }}>{a.antibiotic}</p>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-5">
+            <Stat label="n" value={N} />
+            <Stat label="MIC₅₀" value={a.pct ? log2Label(a.pct.mic50) : "—"} />
+            <Stat label="MIC₉₀" value={a.pct ? log2Label(a.pct.mic90) : "—"} />
+            <Stat label="ช่วง" value={a.pct ? `${log2Label(a.pct.min)}–${log2Label(a.pct.max)}` : "—"} />
+          </div>
+        </div>
+      </div>
+
+      {/* chart */}
+      <div className="rounded-lg border p-4" style={{ borderColor: C.line, background: C.surface }}>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold" style={display}>การกระจายค่า MIC (mg/L)</h3>
+          <div className="flex items-center gap-3 text-xs" style={{ color: C.sub }}>
+            <span className="flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-sm" style={{ background: C.wt }} /> Wild-type</span>
+            <span className="flex items-center gap-1"><span className="h-2.5 w-2.5 rounded-sm" style={{ background: C.nwt }} /> Non-wild-type</span>
+          </div>
+        </div>
+        <div style={{ width: "100%", height: 280 }}>
+          <ResponsiveContainer>
+            <BarChart data={chartData} margin={{ top: 16, right: 12, left: 0, bottom: 4 }}>
+              <XAxis dataKey="label" tick={{ fontSize: 11, fill: C.sub, fontFamily: "IBM Plex Mono" }} interval={0} angle={-35} textAnchor="end" height={50} />
+              <YAxis tick={{ fontSize: 11, fill: C.sub }} allowDecimals={false} />
+              <Tooltip
+                cursor={{ fill: "rgba(14,124,123,0.06)" }}
+                contentStyle={{ borderRadius: 8, border: `1px solid ${C.line}`, fontSize: 12 }}
+                formatter={(v, n) => [v, n === "wt" ? "Wild-type" : n === "nwt" ? "Non-wild-type" : "จำนวน"]}
+                labelFormatter={(l) => `MIC = ${l} mg/L`}
+              />
+              <Bar dataKey="count" radius={[3, 3, 0, 0]} maxBarSize={46}>
+                {chartData.map((d, i) => (
+                  <Cell key={i} fill={eff != null ? (d.log2 > eff ? C.nwt : C.wt) : C.teal} />
+                ))}
+                <LabelList dataKey="count" position="top" style={{ fontSize: 10, fill: C.sub }} formatter={(v) => v || ""} />
+              </Bar>
+              {eff != null && (
+                <ReferenceLine x={chartData.find((d) => d.log2 === eff)?.label} stroke={C.rose} strokeWidth={2} strokeDasharray="5 3"
+                  label={{ value: `ECOFF ≤ ${log2Label(eff)}`, position: "top", fill: C.rose, fontSize: 11, fontWeight: 600 }} />
+              )}
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* ECOFF panel */}
+        <div className="rounded-lg border p-4" style={{ borderColor: C.line, background: C.surface }}>
+          <h3 className="text-sm font-semibold mb-3" style={display}>ค่า ECOFF & การแปลผล</h3>
+          {a.ecoff ? (
+            <>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <Stat label="ECOFF (95%)" value={log2Label(a.ecoff.e95)} sub="mg/L" />
+                <Stat label="ECOFF (99%)" value={log2Label(a.ecoff.e99)} sub="แนะนำ · mg/L" />
+                <Stat label="Mean (log₂)" value={a.ecoff.mean.toFixed(2)} />
+                <Stat label="Goodness R²" value={a.ecoff.r2.toFixed(3)} />
+              </div>
+              <div className="rounded-md p-3 mb-3" style={{ background: C.bg }}>
+                <div className="flex items-center justify-between text-sm mb-1">
+                  <span style={{ color: C.sub }}>Wild-type (≤ ECOFF)</span>
+                  <span className="font-semibold" style={{ ...mono, color: C.teal }}>{wtPct.toFixed(1)}%</span>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span style={{ color: C.sub }}>Non-wild-type (&gt; ECOFF)</span>
+                  <span className="font-semibold" style={{ ...mono, color: C.amber }}>{(100 - wtPct).toFixed(1)}% ({nwtCount}/{N})</span>
+                </div>
+                <div className="mt-2 h-2 w-full rounded-full overflow-hidden" style={{ background: C.amberSoft }}>
+                  <div className="h-full" style={{ width: `${wtPct}%`, background: C.teal }} />
+                </div>
+              </div>
+              <label className="block text-sm">
+                <span className="text-xs" style={{ color: C.sub }}>กำหนด ECOFF เอง (override) — เช่น ใช้ค่าทางการของ EUCAST</span>
+                <div className="flex items-center gap-2 mt-1">
+                  <select value={a.manualEcoff ?? ""} onChange={(e) => onOverride(a.organism, a.antibiotic, e.target.value === "" ? null : Number(e.target.value))}
+                    className="flex-1 rounded-md border px-2 py-1.5 text-sm" style={{ ...mono, borderColor: C.line2 }}>
+                    <option value="">ใช้ค่าที่คำนวณ (99%) = {log2Label(a.ecoff.e99)}</option>
+                    {ecoffOpts.map((k) => <option key={k} value={k}>{log2Label(k)} mg/L</option>)}
+                  </select>
+                </div>
+              </label>
+            </>
+          ) : (
+            <p className="text-sm" style={{ color: C.sub }}>ข้อมูลไม่พอสำหรับการ fit — ต้องการการกระจายที่มีจำนวนเพียงพอและมีพีคชัดเจน</p>
+          )}
+        </div>
+
+        {/* QC panel */}
+        <div className="rounded-lg border p-4" style={{ borderColor: C.line, background: C.surface }}>
+          <h3 className="text-sm font-semibold mb-3" style={display}>การตรวจสอบคุณภาพ (QC) & ข้อสังเกต</h3>
+          <ul className="space-y-2">
+            {a.flags.map((f, i) => {
+              const map = { error: { c: C.rose, t: "ข้อผิดพลาด", bg: C.roseSoft }, warn: { c: C.amber, t: "ควรตรวจสอบ", bg: C.amberSoft }, info: { c: C.teal, t: "ข้อมูล", bg: C.tealSoft }, ok: { c: C.emerald, t: "ผ่าน", bg: "#D1FAE5" } }[f.level];
+              return (
+                <li key={i} className="flex gap-2 rounded-md p-2 text-sm" style={{ background: map.bg }}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={map.c} strokeWidth="2" className="mt-0.5 shrink-0">
+                    {f.level === "ok" ? <path d="M20 6 9 17l-5-5" /> : <><circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" /></>}
+                  </svg>
+                  <span style={{ color: C.ink }}><b style={{ color: map.c }}>{map.t}:</b> {f.msg}</span>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      </div>
+
+      <p className="text-xs leading-relaxed rounded-md p-3" style={{ background: C.bg, color: C.sub }}>
+        <b>หมายเหตุวิธีคำนวณ:</b> ECOFF ประเมินด้วยการ fit การกระจายแบบ log-normal กับประชากร wild-type (วิธี ECOFFinder, Turnidge et al. 2006) ค่าที่ได้เป็นการประมาณเชิงสถิติ
+        ควรตรวจสอบด้วยตาและเทียบกับค่าทางการของ EUCAST ก่อนใช้งานจริง การกำหนด ECOFF ที่เชื่อถือได้ควรใช้ข้อมูลรวม ≥100 isolates จากหลายแหล่ง
+      </p>
+    </div>
+  );
+}
+
+function RawData({ analyses, onEdit }) {
+  const [q, setQ] = useState("");
+  const filtered = analyses.filter((a) => (a.organism + a.antibiotic).toLowerCase().includes(q.toLowerCase()));
+  return (
+    <div className="rounded-lg border p-4" style={{ borderColor: C.line, background: C.surface }}>
+      <div className="flex items-center justify-between mb-3 gap-3">
+        <h3 className="text-sm font-semibold" style={display}>ข้อมูลดิบ — แก้ไขจำนวนได้ทันที (อัปเดตการวิเคราะห์แบบ real-time)</h3>
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="ค้นหาเชื้อ/ยา…" className="rounded-md border px-2 py-1.5 text-sm w-48" style={{ borderColor: C.line2 }} />
+      </div>
+      <div className="overflow-auto mic-scroll" style={{ maxHeight: 520 }}>
+        {filtered.map((a, idx) => {
+          const entries = [...a.dist.entries()].map(([l, c]) => ({ l: Number(l), c })).sort((x, y) => x.l - y.l);
+          return (
+            <div key={idx} className="mb-4">
+              <div className="flex items-center gap-2 mb-1 sticky top-0 py-1" style={{ background: C.surface }}>
+                <span className="text-sm font-semibold italic" style={display}>{a.organism}</span>
+                <span className="text-xs" style={{ color: C.sub }}>· {a.antibiotic}</span>
+              </div>
+              <table className="w-full text-sm" style={mono}>
+                <thead>
+                  <tr style={{ color: C.sub }}>
+                    <th className="text-left font-medium py-1 pr-3">MIC (mg/L)</th>
+                    {entries.map((e) => <th key={e.l} className="px-1 text-center font-medium">{log2Label(e.l)}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td className="py-1 pr-3" style={{ color: C.sub }}>จำนวน</td>
+                    {entries.map((e) => (
+                      <td key={e.l} className="px-1">
+                        <input type="number" min="0" value={e.c}
+                          onChange={(ev) => onEdit(a.organism, a.antibiotic, e.l, ev.target.value)}
+                          className="w-14 rounded border px-1 py-0.5 text-center" style={{ borderColor: C.line2 }} />
+                      </td>
+                    ))}
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          );
+        })}
+        {filtered.length === 0 && <p className="text-sm" style={{ color: C.sub }}>ไม่พบรายการที่ตรงกับการค้นหา</p>}
+      </div>
+      <p className="text-xs mt-3" style={{ color: C.sub }}>เปลี่ยนค่าจำนวนในตารางแล้วกราฟ ECOFF และการแปลผลจะคำนวณใหม่ทันที พร้อมบันทึกอัตโนมัติ</p>
+    </div>
+  );
+}
